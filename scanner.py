@@ -483,6 +483,27 @@ class App(tk.Tk):
         self._placeholder_lbl = lbl
 
     def _build_controls(self, parent):
+        # run btn — always at top so it's always visible
+        self.run_btn = tk.Button(
+            parent, text="▶  run scan",
+            font=("Georgia", 13, "bold"),
+            bg=ACCENT, fg=BG,
+            activebackground=ACCENT2, activeforeground=BG,
+            relief="flat", bd=0, padx=0, pady=12,
+            cursor="hand2", command=self._start
+        )
+        self.run_btn.pack(fill="x", pady=(0, 12))
+
+        # view btn (hidden until done)
+        self.view_btn = tk.Button(
+            parent, text="🔍  open 3D viewer",
+            font=("Georgia", 11),
+            bg=CARD2, fg=ACCENT2,
+            activebackground=HIGHLIGHT, activeforeground=ACCENT2,
+            relief="flat", bd=0, padx=0, pady=8,
+            cursor="hand2", command=self._open_viewer
+        )
+
         self._input_card(parent, "📂  image folder",
                          "folder containing your drone photos",
                          self.folder_var, self._pick_folder)
@@ -512,7 +533,7 @@ class App(tk.Tk):
                      anchor="w", pady=(0, 4))
         log_frame = tk.Frame(parent, bg=CARD,
                              highlightbackground=BORDER, highlightthickness=1)
-        log_frame.pack(fill="both", expand=True, pady=(0, 12))
+        log_frame.pack(fill="both", expand=True)
         sb = tk.Scrollbar(log_frame, bg=CARD, troughcolor=CARD)
         sb.pack(side="right", fill="y")
         self.log_box = tk.Text(
@@ -523,27 +544,6 @@ class App(tk.Tk):
         )
         self.log_box.pack(fill="both", expand=True)
         sb.config(command=self.log_box.yview)
-
-        # run btn
-        self.run_btn = tk.Button(
-            parent, text="▶  run scan",
-            font=("Georgia", 13, "bold"),
-            bg=ACCENT, fg=BG,
-            activebackground=ACCENT2, activeforeground=BG,
-            relief="flat", bd=0, padx=0, pady=12,
-            cursor="hand2", command=self._start
-        )
-        self.run_btn.pack(fill="x")
-
-        # view btn (hidden until done)
-        self.view_btn = tk.Button(
-            parent, text="🔍  open 3D viewer",
-            font=("Georgia", 11),
-            bg=CARD2, fg=ACCENT2,
-            activebackground=HIGHLIGHT, activeforeground=ACCENT2,
-            relief="flat", bd=0, padx=0, pady=8,
-            cursor="hand2", command=self._open_viewer
-        )
 
     def _input_card(self, parent, title, subtitle, var, cmd):
         card = tk.Frame(parent, bg=CARD,
