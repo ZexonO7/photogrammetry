@@ -150,15 +150,45 @@ def estimate_camera(img_shape):
                      [0, 0,   1]], dtype=np.float64)
 
 
+def triangulate_gpu(P1, P2, pts1, pts2, xp):
+    """Triangulate points using GPU (cupy) or CPU (numpy) depending on xp."""
+    # build 4x4 DLT system per point on GPU in batch
+    n   = pts1.shape[1]
+    A   = xp.zeros((n, 4, 4), dtype=xp.float64)
+    A[:, 0] = pts1[0:1].T * P1[2] - P1[0]
+    A[:, 1] = pts1[1:2].T * P1[2] - P1[1]
+    A[:, 2] = pts2[0:1].T * P2[2] - P2[0]
+    A[:, 3] = pts2[1:2].T * P2[2] - P2[1]
+    # SVD per point — last singular vector is the solution
+    _, _, Vt = xp.linalg.svd(A)
+    X = Vt[:, -1, :]          # (n, 4)
+    X = X / X[:, 3:4]
+    return X[:, :3]            # (n, 3)
+
+
 def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
     from concurrent.futures import ThreadPoolExecutor
     import threading
+
+    # try to use GPU via cupy, fall back to numpy
+    try:
+        import cupy as xp
+        xp.zeros(1)  # test GPU is accessible
+        gpu = True
+        log("  🎮  GPU detected — using RTX 4070 for triangulation")
+    except Exception:
+        xp = np
+        gpu = False
+        log("  💻  GPU not available — using CPU")
 
     K = estimate_camera(imgs[0][1].shape)
     log(f"  camera intrinsics  (focal={K[0,0]:.1f}px)")
     log(f"  K = [{K[0,0]:.0f}  0  {K[0,2]:.0f}]")
     log(f"      [  0  {K[1,1]:.0f}  {K[1,2]:.0f}]")
     log(f"      [  0    0    1  ]")
+
+    # upload K to GPU once
+    K_xp = xp.array(K)
 
     pts3d_all = []
     col_all   = []
@@ -173,6 +203,7 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
         src_pts = np.float32([kp1[m.queryIdx].pt for m in good])
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good])
 
+        # essential matrix on CPU (opencv doesnt support GPU here)
         E, mask = cv2.findEssentialMat(
             src_pts, dst_pts, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
         )
@@ -182,17 +213,24 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
         _, R, t, mask2 = cv2.recoverPose(E, src_pts, dst_pts, K, mask=mask)
         angle = math.degrees(math.acos(max(-1, min(1, (np.trace(R) - 1) / 2))))
 
-        P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-        P2 = K @ np.hstack([R, t])
-
         inliers = mask2.ravel() == 255
         if inliers.sum() < 8:
             return
 
-        pts4d = cv2.triangulatePoints(P1, P2, src_pts[inliers].T, dst_pts[inliers].T)
-        pts4d /= pts4d[3]
-        pts3d  = pts4d[:3].T
+        # build projection matrices on GPU
+        P1_xp = K_xp @ xp.array(np.hstack([np.eye(3),   np.zeros((3,1))]))
+        P2_xp = K_xp @ xp.array(np.hstack([R,            t              ]))
 
+        # upload inlier points to GPU and triangulate there
+        s = xp.array(src_pts[inliers].T.astype(np.float64))  # (2, n)
+        d = xp.array(dst_pts[inliers].T.astype(np.float64))  # (2, n)
+
+        pts3d_gpu = triangulate_gpu(P1_xp, P2_xp, s, d, xp)
+
+        # pull back to CPU
+        pts3d = pts3d_gpu.get() if gpu else pts3d_gpu
+
+        # colour lookup on CPU
         img_bgr = imgs[i][1]
         h, w    = img_bgr.shape[:2]
         colours = []
@@ -219,14 +257,13 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
 
         log(f"  pair {idx+1}: {angle:.1f}°  {len(batch_pts):,} pts  ({mask.sum()} inliers)")
 
-        # update 3D viz every 50 pairs
         if on_points and cnt % 50 == 1:
             with lock:
                 if pts3d_all:
                     on_points(np.vstack(pts3d_all), np.vstack(col_all))
 
     workers = max(1, __import__('os').cpu_count() - 1)
-    log(f"  reconstructing {len(pairs)} pairs on {workers} cores…")
+    log(f"  reconstructing {len(pairs)} pairs on {workers} CPU cores + GPU triangulation…")
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(process_pair, enumerate(pairs)))
