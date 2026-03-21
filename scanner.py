@@ -100,22 +100,39 @@ def detect_features(imgs, log, on_keypoints=None):
 
 
 def match_features(kp_desc, imgs, log, on_match=None):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
     bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+    n  = len(kp_desc)
+
+    all_pairs = [(i, j) for i in range(n) for j in range(i+1, n)]
+    log(f"  {len(all_pairs):,} pairs to match")
+
     pairs = []
-    n = len(kp_desc)
-    for i in range(n):
-        for j in range(i + 1, n):
-            des1, des2 = kp_desc[i][1], kp_desc[j][1]
-            if des1 is None or des2 is None:
-                continue
-            raw  = bf.knnMatch(des1, des2, k=2)
-            good = [m for m, nn in raw if m.distance < 0.75 * nn.distance]
-            if len(good) >= 8:
+    lock  = threading.Lock()
+
+    def match_pair(args):
+        i, j = args
+        des1, des2 = kp_desc[i][1], kp_desc[j][1]
+        if des1 is None or des2 is None:
+            return
+        raw  = bf.knnMatch(des1, des2, k=2)
+        good = [m for m, nn in raw if m.distance < 0.75 * nn.distance]
+        if len(good) >= 8:
+            with lock:
                 pairs.append((i, j, good))
-                log(f"  pair ({i+1},{j+1})  →  {len(good):,} good matches")
-                if on_match:
-                    on_match(imgs[i][1], imgs[j][1],
-                             kp_desc[i][0], kp_desc[j][0], good)
+            log(f"  pair ({i+1},{j+1})  →  {len(good):,} good matches")
+            if on_match:
+                on_match(imgs[i][1], imgs[j][1],
+                         kp_desc[i][0], kp_desc[j][0], good)
+
+    workers = max(1, __import__('os').cpu_count() - 1)
+    log(f"  running on {workers} CPU cores in parallel")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(match_pair, all_pairs))
+
+    pairs.sort(key=lambda x: (x[0], x[1]))
     log(f"  total: {len(pairs)} usable pairs")
     return pairs
 
@@ -433,9 +450,12 @@ class App(tk.Tk):
         self.folder_var = tk.StringVar()
         self.out_var    = tk.StringVar()
         self.status_var = tk.StringVar(value="ready")
+        self.timer_var  = tk.StringVar(value="")
         self.running    = False
         self._pcd       = None
         self.vis        = None
+        self._timer_start = None
+        self._timer_job   = None
         self._build()
         self._center()
 
@@ -450,6 +470,8 @@ class App(tk.Tk):
                      side="left", padx=18, pady=(4,0))
         tk.Label(hdr, textvariable=self.status_var,
                  font=("Consolas", 9), bg=SURFACE, fg=ACCENT).pack(side="right")
+        tk.Label(hdr, textvariable=self.timer_var,
+                 font=("Consolas", 9), bg=SURFACE, fg=ACCENT2).pack(side="right", padx=(0,16))
 
         # step bar
         self.stepbar = StepBar(self, pady=8)
@@ -607,6 +629,7 @@ class App(tk.Tk):
         self.status_var.set("processing…")
         self._clear_log()
         self.stepbar.set_step(0)
+        self._start_timer()
 
         threading.Thread(
             target=self._thread_run,
@@ -638,6 +661,7 @@ class App(tk.Tk):
         self._pcd = pcd
         def update():
             self.running = False
+            self._stop_timer()
             self.run_btn.config(state="normal", bg=ACCENT, fg=BG)
             self.stepbar.set_step(len(STEPS) - 1)
             self.status_var.set("✓  done")
@@ -647,6 +671,7 @@ class App(tk.Tk):
     def _err(self, msg, tb=""):
         def update():
             self.running = False
+            self._stop_timer()
             self.run_btn.config(state="normal", bg=ACCENT, fg=BG)
             self.status_var.set("✗  error")
             self._write(f"\n✗  {msg}")
@@ -659,6 +684,25 @@ class App(tk.Tk):
         if self._pcd is not None:
             threading.Thread(target=open_viewer,
                              args=(self._pcd,), daemon=True).start()
+
+    def _start_timer(self):
+        import time as _time
+        self._timer_start = _time.time()
+        self._tick_timer()
+
+    def _tick_timer(self):
+        if self._timer_start is None:
+            return
+        import time as _time
+        elapsed = int(_time.time() - self._timer_start)
+        m, s = divmod(elapsed, 60)
+        self.timer_var.set(f"⏱  {m:02d}:{s:02d}")
+        self._timer_job = self.after(1000, self._tick_timer)
+
+    def _stop_timer(self):
+        if self._timer_job:
+            self.after_cancel(self._timer_job)
+            self._timer_job = None
 
     def _write(self, msg):
         def update():
