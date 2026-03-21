@@ -167,17 +167,3 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
-```
-
----
-
-**how to set it up:**
-
-1. save that as `drone_scanner.py`
-2. open terminal / cmd and run:
-```
-pip install opencv-python numpy open3d
-```
-3. run it:
-```
-python drone_scanner.py
