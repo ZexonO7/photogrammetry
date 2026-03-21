@@ -156,25 +156,22 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
-    # try to use GPU via cupy, fall back to numpy
+    # GPU via cupy if available
     try:
-        import cupy as xp
-        xp.zeros(1)  # test GPU is accessible
+        import cupy as cp
+        cp.zeros(1)
         gpu = True
-        log("  🎮  GPU detected — using RTX 4070 for triangulation")
+        log("  GPU ready — RTX 4070 active")
     except Exception:
-        xp = np
+        cp  = None
         gpu = False
-        log("  💻  GPU not available — using CPU")
+        log("  GPU not available — using CPU")
 
     K = estimate_camera(imgs[0][1].shape)
     log(f"  camera intrinsics  (focal={K[0,0]:.1f}px)")
     log(f"  K = [{K[0,0]:.0f}  0  {K[0,2]:.0f}]")
     log(f"      [  0  {K[1,1]:.0f}  {K[1,2]:.0f}]")
     log(f"      [  0    0    1  ]")
-
-    # upload K to GPU once
-    K_xp = xp.array(K)
 
     pts3d_all = []
     col_all   = []
@@ -189,7 +186,6 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
         src_pts = np.float32([kp1[m.queryIdx].pt for m in good])
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good])
 
-        # essential matrix on CPU (opencv doesnt support GPU here)
         E, mask = cv2.findEssentialMat(
             src_pts, dst_pts, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
         )
@@ -199,24 +195,21 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
         _, R, t, mask2 = cv2.recoverPose(E, src_pts, dst_pts, K, mask=mask)
         angle = math.degrees(math.acos(max(-1, min(1, (np.trace(R) - 1) / 2))))
 
+        P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        P2 = K @ np.hstack([R, t])
+
         inliers = mask2.ravel() == 255
         if inliers.sum() < 8:
             return
 
-        # build projection matrices on GPU
-        P1_xp = K_xp @ xp.array(np.hstack([np.eye(3),   np.zeros((3,1))]))
-        P2_xp = K_xp @ xp.array(np.hstack([R,            t              ]))
+        # triangulate with opencv (reliable)
+        pts4d = cv2.triangulatePoints(
+            P1, P2, src_pts[inliers].T, dst_pts[inliers].T
+        )
+        pts4d /= pts4d[3]
+        pts3d  = pts4d[:3].T  # (n, 3) numpy array
 
-        # upload inlier points to GPU and triangulate there
-        s = xp.array(src_pts[inliers].T.astype(np.float64))  # (2, n)
-        d = xp.array(dst_pts[inliers].T.astype(np.float64))  # (2, n)
-
-        pts3d_gpu = triangulate_gpu(P1_xp, P2_xp, s, d, xp)
-
-        # pull back to CPU
-        pts3d = pts3d_gpu.get() if gpu else pts3d_gpu
-
-        # colour lookup on CPU
+        # colour lookup
         img_bgr = imgs[i][1]
         h, w    = img_bgr.shape[:2]
         colours = []
@@ -225,15 +218,28 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
             py = int(np.clip(py, 0, h - 1))
             b, g, r = img_bgr[py, px]
             colours.append([r/255.0, g/255.0, b/255.0])
+        colours = np.array(colours)
 
-        depths = pts3d[:, 2]
-        valid  = depths > 0
-        if not valid.any():
-            return
-        keep = valid & (depths < np.percentile(depths[valid], 95))
+        # outlier depth filtering — use GPU if available
+        if gpu and cp is not None:
+            depths = cp.array(pts3d[:, 2])
+            valid  = depths > 0
+            if not bool(valid.any()):
+                return
+            thresh = float(cp.percentile(depths[valid], 95))
+            keep   = cp.asnumpy((depths > 0) & (depths < thresh))
+        else:
+            depths = pts3d[:, 2]
+            valid  = depths > 0
+            if not valid.any():
+                return
+            keep = valid & (depths < np.percentile(depths[valid], 95))
 
         batch_pts = pts3d[keep]
-        batch_col = np.array(colours)[keep]
+        batch_col = colours[keep]
+
+        if len(batch_pts) == 0:
+            return
 
         with lock:
             pts3d_all.append(batch_pts)
@@ -241,7 +247,7 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
             counter[0] += 1
             cnt = counter[0]
 
-        log(f"  pair {idx+1}: {angle:.1f}°  {len(batch_pts):,} pts  ({mask.sum()} inliers)")
+        log(f"  pair {idx+1}: {angle:.1f}  {len(batch_pts):,} pts  ({mask.sum()} inliers)")
 
         if on_points and cnt % 50 == 1:
             with lock:
@@ -249,7 +255,7 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
                     on_points(np.vstack(pts3d_all), np.vstack(col_all))
 
     workers = max(1, __import__('os').cpu_count() - 1)
-    log(f"  reconstructing {len(pairs)} pairs on {workers} CPU cores + GPU triangulation…")
+    log(f"  {len(pairs)} pairs  |  {workers} CPU cores  |  GPU filtering: {gpu}")
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(process_pair, enumerate(pairs)))
@@ -259,7 +265,6 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
 
     log(f"  merged {len(pts3d_all)} batches into final cloud")
     return np.vstack(pts3d_all), np.vstack(col_all)
-
 
 def save_cloud(pts3d, colours, out_path, log):
     pcd = o3d.geometry.PointCloud()
