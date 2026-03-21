@@ -151,6 +151,9 @@ def estimate_camera(img_shape):
 
 
 def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
     K = estimate_camera(imgs[0][1].shape)
     log(f"  camera intrinsics  (focal={K[0,0]:.1f}px)")
     log(f"  K = [{K[0,0]:.0f}  0  {K[0,2]:.0f}]")
@@ -159,42 +162,41 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
 
     pts3d_all = []
     col_all   = []
+    lock      = threading.Lock()
+    counter   = [0]
 
-    for idx, (i, j, good) in enumerate(pairs):
+    def process_pair(args):
+        idx, (i, j, good) = args
         kp1, _ = kp_desc[i]
         kp2, _ = kp_desc[j]
 
-        src = np.float32([kp1[m.queryIdx].pt for m in good])
-        dst = np.float32([kp2[m.trainIdx].pt for m in good])
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good])
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good])
 
         E, mask = cv2.findEssentialMat(
-            src, dst, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
+            src_pts, dst_pts, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
         )
         if E is None or mask is None:
-            continue
+            return
 
-        log(f"  pair {idx+1}: E matrix  ({mask.sum()} inliers / {len(good)} matches)")
-
-        _, R, t, mask2 = cv2.recoverPose(E, src, dst, K, mask=mask)
-        angle = math.degrees(math.acos(
-            max(-1, min(1, (np.trace(R) - 1) / 2))
-        ))
-        log(f"  pair {idx+1}: rotation={angle:.1f}°  |t|={np.linalg.norm(t):.3f}")
+        _, R, t, mask2 = cv2.recoverPose(E, src_pts, dst_pts, K, mask=mask)
+        angle = math.degrees(math.acos(max(-1, min(1, (np.trace(R) - 1) / 2))))
 
         P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
         P2 = K @ np.hstack([R, t])
 
         inliers = mask2.ravel() == 255
         if inliers.sum() < 8:
-            continue
-        pts4d   = cv2.triangulatePoints(P1, P2, src[inliers].T, dst[inliers].T)
-        pts4d  /= pts4d[3]
-        pts3d   = pts4d[:3].T
+            return
+
+        pts4d = cv2.triangulatePoints(P1, P2, src_pts[inliers].T, dst_pts[inliers].T)
+        pts4d /= pts4d[3]
+        pts3d  = pts4d[:3].T
 
         img_bgr = imgs[i][1]
         h, w    = img_bgr.shape[:2]
         colours = []
-        for (px, py) in src[inliers]:
+        for (px, py) in src_pts[inliers]:
             px = int(np.clip(px, 0, w - 1))
             py = int(np.clip(py, 0, h - 1))
             b, g, r = img_bgr[py, px]
@@ -203,19 +205,36 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
         depths = pts3d[:, 2]
         valid  = depths > 0
         if not valid.any():
-            continue
+            return
         keep = valid & (depths < np.percentile(depths[valid], 95))
 
-        pts3d_all.append(pts3d[keep])
-        col_all.append(np.array(colours)[keep])
-        log(f"  pair {idx+1}: {len(pts3d[keep]):,} 3D points added")
+        batch_pts = pts3d[keep]
+        batch_col = np.array(colours)[keep]
 
-        if on_points:
-            on_points(np.vstack(pts3d_all), np.vstack(col_all))
+        with lock:
+            pts3d_all.append(batch_pts)
+            col_all.append(batch_col)
+            counter[0] += 1
+            cnt = counter[0]
+
+        log(f"  pair {idx+1}: {angle:.1f}°  {len(batch_pts):,} pts  ({mask.sum()} inliers)")
+
+        # update 3D viz every 50 pairs
+        if on_points and cnt % 50 == 1:
+            with lock:
+                if pts3d_all:
+                    on_points(np.vstack(pts3d_all), np.vstack(col_all))
+
+    workers = max(1, __import__('os').cpu_count() - 1)
+    log(f"  reconstructing {len(pairs)} pairs on {workers} cores…")
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(process_pair, enumerate(pairs)))
 
     if not pts3d_all:
         raise RuntimeError("Reconstruction failed — need more overlapping photos!")
 
+    log(f"  merged {len(pts3d_all)} batches into final cloud")
     return np.vstack(pts3d_all), np.vstack(col_all)
 
 
