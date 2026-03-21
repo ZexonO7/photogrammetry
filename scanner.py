@@ -185,6 +185,8 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
         P2 = K @ np.hstack([R, t])
 
         inliers = mask2.ravel() == 255
+        if inliers.sum() < 8:
+            continue
         pts4d   = cv2.triangulatePoints(P1, P2, src[inliers].T, dst[inliers].T)
         pts4d  /= pts4d[3]
         pts3d   = pts4d[:3].T
