@@ -150,20 +150,6 @@ def estimate_camera(img_shape):
                      [0, 0,   1]], dtype=np.float64)
 
 
-def triangulate_gpu(P1, P2, pts1, pts2, xp):
-    """Triangulate points using GPU (cupy) or CPU (numpy) depending on xp."""
-    # build 4x4 DLT system per point on GPU in batch
-    n   = pts1.shape[1]
-    A   = xp.zeros((n, 4, 4), dtype=xp.float64)
-    A[:, 0] = pts1[0:1].T * P1[2] - P1[0]
-    A[:, 1] = pts1[1:2].T * P1[2] - P1[1]
-    A[:, 2] = pts2[0:1].T * P2[2] - P2[0]
-    A[:, 3] = pts2[1:2].T * P2[2] - P2[1]
-    # SVD per point — last singular vector is the solution
-    _, _, Vt = xp.linalg.svd(A)
-    X = Vt[:, -1, :]          # (n, 4)
-    X = X / X[:, 3:4]
-    return X[:, :3]            # (n, 3)
 
 
 def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
