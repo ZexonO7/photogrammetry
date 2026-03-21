@@ -112,6 +112,8 @@ def match_features(kp_desc, imgs, log, on_match=None):
     pairs = []
     lock  = threading.Lock()
 
+    match_counter = [0]
+
     def match_pair(args):
         i, j = args
         des1, des2 = kp_desc[i][1], kp_desc[j][1]
@@ -122,8 +124,11 @@ def match_features(kp_desc, imgs, log, on_match=None):
         if len(good) >= 8:
             with lock:
                 pairs.append((i, j, good))
+                match_counter[0] += 1
+                cnt = match_counter[0]
             log(f"  pair ({i+1},{j+1})  →  {len(good):,} good matches")
-            if on_match:
+            # only redraw viz every 20 matches to avoid choking the GUI
+            if on_match and cnt % 20 == 1:
                 on_match(imgs[i][1], imgs[j][1],
                          kp_desc[i][0], kp_desc[j][0], good)
 
@@ -325,7 +330,6 @@ class VisPanel:
             self.canvas.draw_idle()
 
         self.parent.after(0, _draw)
-        time.sleep(0.04)
 
     def show_matches(self, img1, img2, kp1, kp2, good_matches):
         def _draw():
@@ -361,7 +365,6 @@ class VisPanel:
             self.canvas.draw_idle()
 
         self.parent.after(0, _draw)
-        time.sleep(0.04)
 
     def show_cloud(self, pts3d, colours):
         def _draw():
@@ -388,7 +391,6 @@ class VisPanel:
             self.canvas.draw_idle()
 
         self.parent.after(0, _draw)
-        time.sleep(0.04)
 
 
 # ══════════════════════════════════════════
