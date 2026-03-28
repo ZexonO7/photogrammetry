@@ -86,7 +86,7 @@ def load_images(folder, log):
 
 
 def detect_features(imgs, log, on_keypoints=None):
-    sift = cv2.SIFT_create(nfeatures=3000)
+    sift = cv2.SIFT_create(nfeatures=2000)
     kp_desc = []
     for i, (path, img) in enumerate(imgs):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -120,8 +120,8 @@ def match_features(kp_desc, imgs, log, on_match=None):
         if des1 is None or des2 is None:
             return
         raw  = bf.knnMatch(des1, des2, k=2)
-        good = [m for m, nn in raw if m.distance < 0.75 * nn.distance]
-        if len(good) >= 8:
+        good = [m for m, nn in raw if m.distance < 0.78 * nn.distance]
+        if len(good) >= 10:
             with lock:
                 pairs.append((i, j, good))
                 match_counter[0] += 1
@@ -156,27 +156,14 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
-    # GPU via cupy if available
-    try:
-        import cupy as cp
-        cp.zeros(1)
-        gpu = True
-        log("  GPU ready — RTX 4070 active")
-    except Exception:
-        cp  = None
-        gpu = False
-        log("  GPU not available — using CPU")
-
     K = estimate_camera(imgs[0][1].shape)
     log(f"  camera intrinsics  (focal={K[0,0]:.1f}px)")
-    log(f"  K = [{K[0,0]:.0f}  0  {K[0,2]:.0f}]")
-    log(f"      [  0  {K[1,1]:.0f}  {K[1,2]:.0f}]")
-    log(f"      [  0    0    1  ]")
 
     pts3d_all = []
     col_all   = []
     lock      = threading.Lock()
     counter   = [0]
+    skipped   = [0]
 
     def process_pair(args):
         idx, (i, j, good) = args
@@ -186,84 +173,92 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
         src_pts = np.float32([kp1[m.queryIdx].pt for m in good])
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good])
 
-        E, mask = cv2.findEssentialMat(
-            src_pts, dst_pts, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
-        )
-        if E is None or mask is None:
-            return
-
-        _, R, t, mask2 = cv2.recoverPose(E, src_pts, dst_pts, K, mask=mask)
-        angle = math.degrees(math.acos(max(-1, min(1, (np.trace(R) - 1) / 2))))
-
-        P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-        P2 = K @ np.hstack([R, t])
-
-        inliers = mask2.ravel() == 255
-        if inliers.sum() < 8:
-            return
-
-        # triangulate with opencv (reliable)
-        pts4d = cv2.triangulatePoints(
-            P1, P2, src_pts[inliers].T, dst_pts[inliers].T
-        )
-        pts4d /= pts4d[3]
-        pts3d  = pts4d[:3].T  # (n, 3) numpy array
-
-        # colour lookup
-        img_bgr = imgs[i][1]
-        h, w    = img_bgr.shape[:2]
-        colours = []
-        for (px, py) in src_pts[inliers]:
-            px = int(np.clip(px, 0, w - 1))
-            py = int(np.clip(py, 0, h - 1))
-            b, g, r = img_bgr[py, px]
-            colours.append([r/255.0, g/255.0, b/255.0])
-        colours = np.array(colours)
-
-        # outlier depth filtering — use GPU if available
-        if gpu and cp is not None:
-            depths = cp.array(pts3d[:, 2])
-            valid  = depths > 0
-            if not bool(valid.any()):
+        try:
+            E, mask = cv2.findEssentialMat(
+                src_pts, dst_pts, K, method=cv2.RANSAC, prob=0.99, threshold=1.0
+            )
+            if E is None or mask is None:
+                with lock: skipped[0] += 1
                 return
-            thresh = float(cp.percentile(depths[valid], 95))
-            keep   = cp.asnumpy((depths > 0) & (depths < thresh))
-        else:
+
+            _, R, t, mask2 = cv2.recoverPose(E, src_pts, dst_pts, K, mask=mask)
+            angle = math.degrees(math.acos(max(-1, min(1, (np.trace(R) - 1) / 2))))
+
+            P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+            P2 = K @ np.hstack([R, t])
+
+            inliers = mask2.ravel() == 255
+            if inliers.sum() < 8:
+                with lock: skipped[0] += 1
+                return
+
+            pts4d = cv2.triangulatePoints(
+                P1, P2,
+                src_pts[inliers].T.astype(np.float64),
+                dst_pts[inliers].T.astype(np.float64)
+            )
+            w_coord = pts4d[3]
+            w_coord[np.abs(w_coord) < 1e-10] = 1e-10
+            pts4d  /= w_coord
+            pts3d   = pts4d[:3].T
+
+            img_bgr = imgs[i][1]
+            h, w    = img_bgr.shape[:2]
+            colours = []
+            for (px, py) in src_pts[inliers]:
+                px = int(np.clip(px, 0, w - 1))
+                py = int(np.clip(py, 0, h - 1))
+                b, g, r = img_bgr[py, px]
+                colours.append([r/255.0, g/255.0, b/255.0])
+            colours = np.array(colours)
+
             depths = pts3d[:, 2]
-            valid  = depths > 0
-            if not valid.any():
+            valid  = np.isfinite(depths) & (depths > 0)
+            if valid.sum() < 4:
+                with lock: skipped[0] += 1
                 return
-            keep = valid & (depths < np.percentile(depths[valid], 95))
 
-        batch_pts = pts3d[keep]
-        batch_col = colours[keep]
+            thresh = np.percentile(depths[valid], 95)
+            keep   = valid & (depths < thresh)
 
-        if len(batch_pts) == 0:
-            return
+            batch_pts = pts3d[keep]
+            batch_col = colours[keep]
 
-        with lock:
-            pts3d_all.append(batch_pts)
-            col_all.append(batch_col)
-            counter[0] += 1
-            cnt = counter[0]
+            if len(batch_pts) == 0:
+                with lock: skipped[0] += 1
+                return
 
-        log(f"  pair {idx+1}: {angle:.1f}  {len(batch_pts):,} pts  ({mask.sum()} inliers)")
-
-        if on_points and cnt % 50 == 1:
             with lock:
-                if pts3d_all:
-                    on_points(np.vstack(pts3d_all), np.vstack(col_all))
+                pts3d_all.append(batch_pts)
+                col_all.append(batch_col)
+                counter[0] += 1
+                cnt = counter[0]
+
+            log(f"  pair {idx+1}: {angle:.1f}  {len(batch_pts):,} pts")
+
+            if on_points and cnt % 50 == 1:
+                with lock:
+                    if pts3d_all:
+                        on_points(np.vstack(pts3d_all), np.vstack(col_all))
+
+        except Exception as e:
+            with lock: skipped[0] += 1
 
     workers = max(1, __import__('os').cpu_count() - 1)
-    log(f"  {len(pairs)} pairs  |  {workers} CPU cores  |  GPU filtering: {gpu}")
+    log(f"  {len(pairs)} pairs on {workers} cores…")
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(process_pair, enumerate(pairs)))
 
-    if not pts3d_all:
-        raise RuntimeError("Reconstruction failed — need more overlapping photos!")
+    log(f"  done: {counter[0]} good pairs, {skipped[0]} skipped")
 
-    log(f"  merged {len(pts3d_all)} batches into final cloud")
+    if not pts3d_all:
+        raise RuntimeError(
+            f"Reconstruction failed — 0 valid pairs from {len(pairs)} matches. "
+            "Try photos with more overlap or better lighting."
+        )
+
+    log(f"  merging {len(pts3d_all)} batches…")
     return np.vstack(pts3d_all), np.vstack(col_all)
 
 def save_cloud(pts3d, colours, out_path, log):
