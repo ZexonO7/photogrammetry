@@ -62,6 +62,34 @@ STAGE_MAP = {
     "cloud":     3,
 }
 
+def auto_settings(n_photos, target_minutes):
+    """
+    Returns (nfeatures, ratio, ransac_prob, min_matches) tuned so the job
+    finishes in roughly target_minutes on a modern CPU.
+    Quality degrades gracefully as target time decreases.
+    """
+    # baseline: pairs to process
+    n_pairs = n_photos * (n_photos - 1) // 2
+
+    # each pair takes roughly this long at full quality (seconds, empirical)
+    base_sec_per_pair = 0.12
+    full_time_min = (n_pairs * base_sec_per_pair) / 60
+
+    # ratio: how much we need to speed up
+    if target_minutes <= 0 or full_time_min <= target_minutes:
+        ratio = 1.0   # no need to reduce quality
+    else:
+        ratio = target_minutes / full_time_min
+
+    # map ratio → params
+    # ratio=1.0 → full quality, ratio=0.2 → fast mode
+    nfeatures   = max(500,  int(3000 * ratio))
+    ratio_test  = min(0.85, 0.73 + 0.12 * (1 - ratio))
+    ransac_prob = max(0.95, 0.999 - 0.05 * (1 - ratio))
+    min_matches = max(6,    int(10 - 4 * ratio))
+
+    return nfeatures, ratio_test, ransac_prob, min_matches, full_time_min
+
 
 # ══════════════════════════════════════════
 #  PIPELINE
@@ -99,7 +127,7 @@ def detect_features(imgs, log, on_keypoints=None):
     return kp_desc
 
 
-def match_features(kp_desc, imgs, log, on_match=None):
+def match_features(kp_desc, imgs, log, ratio_test=0.75, min_matches=8, on_match=None):
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
@@ -120,8 +148,8 @@ def match_features(kp_desc, imgs, log, on_match=None):
         if des1 is None or des2 is None:
             return
         raw  = bf.knnMatch(des1, des2, k=2)
-        good = [m for m, nn in raw if m.distance < 0.78 * nn.distance]
-        if len(good) >= 10:
+        good = [m for m, nn in raw if m.distance < ratio_test * nn.distance]
+        if len(good) >= min_matches:
             with lock:
                 pairs.append((i, j, good))
                 match_counter[0] += 1
@@ -152,7 +180,7 @@ def estimate_camera(img_shape):
 
 
 
-def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
+def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
@@ -175,7 +203,7 @@ def reconstruct(kp_desc, pairs, imgs, log, on_points=None):
 
         try:
             E, mask = cv2.findEssentialMat(
-                src_pts, dst_pts, K, method=cv2.RANSAC, prob=0.99, threshold=1.0
+                src_pts, dst_pts, K, method=cv2.RANSAC, prob=ransac_prob, threshold=1.0
             )
             if E is None or mask is None:
                 with lock: skipped[0] += 1
@@ -280,7 +308,7 @@ def open_viewer(pcd):
     )
 
 
-def run_pipeline(folder, out_path, log, vis, done_cb, err_cb):
+def run_pipeline(folder, out_path, target_minutes, log, vis, done_cb, err_cb):
     try:
         lazy_import()
         t0 = time.time()
@@ -289,18 +317,34 @@ def run_pipeline(folder, out_path, log, vis, done_cb, err_cb):
         vis.set_stage("loading")
         imgs = load_images(folder, log)
 
+        # auto-tune quality settings
+        nfeatures, ratio_test, ransac_prob, min_matches, est_full = auto_settings(
+            len(imgs), target_minutes
+        )
+        log(f"\n─── auto settings ({len(imgs)} photos, target {target_minutes}min) ────")
+        log(f"  estimated full-quality time: {est_full:.0f} min")
+        log(f"  keypoints:    {nfeatures}")
+        log(f"  ratio test:   {ratio_test:.2f}")
+        log(f"  RANSAC prob:  {ransac_prob:.3f}")
+        log(f"  min matches:  {min_matches}")
+
         log("\n─── detecting features ───────────────────")
         vis.set_stage("keypoints")
-        kp_desc = detect_features(imgs, log, on_keypoints=vis.show_keypoints)
+        kp_desc = detect_features(imgs, log, nfeatures=nfeatures,
+                                  on_keypoints=vis.show_keypoints)
 
         log("\n─── matching features ────────────────────")
         vis.set_stage("matches")
-        pairs = match_features(kp_desc, imgs, log, on_match=vis.show_matches)
+        pairs = match_features(kp_desc, imgs, log,
+                               ratio_test=ratio_test,
+                               min_matches=min_matches,
+                               on_match=vis.show_matches)
 
         log("\n─── 3D reconstruction ────────────────────")
         vis.set_stage("cloud")
         pts3d, colours = reconstruct(
-            kp_desc, pairs, imgs, log, on_points=vis.show_cloud
+            kp_desc, pairs, imgs, log,
+            ransac_prob=ransac_prob, on_points=vis.show_cloud
         )
 
         log("\n─── saving ───────────────────────────────")
@@ -495,6 +539,8 @@ class App(tk.Tk):
         self.resizable(True, True)
         self.folder_var = tk.StringVar()
         self.out_var    = tk.StringVar()
+        self.time_var   = tk.IntVar(value=30)
+        self._target_min = 30
         self.status_var = tk.StringVar(value="ready")
         self.timer_var  = tk.StringVar(value="")
         self.running    = False
@@ -580,6 +626,39 @@ class App(tk.Tk):
                          self.out_var, self._pick_output)
 
         # tips
+        # time target card
+        tcard = tk.Frame(parent, bg=CARD,
+                         highlightbackground=BORDER, highlightthickness=1,
+                         padx=14, pady=10)
+        tcard.pack(fill="x", pady=(0, 10))
+        top_t = tk.Frame(tcard, bg=CARD)
+        top_t.pack(fill="x")
+        tk.Label(top_t, text="⏱  target time",
+                 font=("Georgia", 10, "bold"), bg=CARD, fg=TEXT).pack(side="left")
+        self.time_lbl = tk.Label(top_t, text="30 min",
+                 font=("Consolas", 9), bg=CARD, fg=ACCENT2)
+        self.time_lbl.pack(side="right")
+        tk.Label(tcard, text="auto-adjusts quality to finish in time",
+                 font=("Consolas", 8), bg=CARD, fg=MUTED).pack(anchor="w")
+        slider = tk.Scale(
+            tcard, from_=5, to=120, orient="horizontal",
+            variable=self.time_var, bg=CARD, fg=TEXT,
+            troughcolor=HIGHLIGHT, activebackground=ACCENT,
+            highlightthickness=0, bd=0, sliderrelief="flat",
+            font=("Consolas", 8), showvalue=False,
+            command=self._update_time_label
+        )
+        slider.pack(fill="x", pady=(4, 0))
+        presets = tk.Frame(tcard, bg=CARD)
+        presets.pack(fill="x", pady=(4, 0))
+        for label, val in [("5m", 5), ("15m", 15), ("30m", 30), ("1hr", 60), ("2hr", 120)]:
+            tk.Button(presets, text=label, font=("Consolas", 8),
+                      bg=HIGHLIGHT, fg=MUTED,
+                      activebackground=BORDER, activeforeground=ACCENT,
+                      relief="flat", bd=0, padx=8, pady=2, cursor="hand2",
+                      command=lambda v=val: (self.time_var.set(v), self._update_time_label(v))
+                      ).pack(side="left", padx=(0, 4))
+
         tips = tk.Frame(parent, bg=CARD,
                         highlightbackground=BORDER, highlightthickness=1,
                         padx=14, pady=10)
@@ -634,6 +713,13 @@ class App(tk.Tk):
                  font=("Consolas", 8), bg=CARD, fg=ACCENT2,
                  wraplength=360, justify="left").pack(anchor="w")
 
+    def _update_time_label(self, val=None):
+        v = self.time_var.get()
+        if v < 60:
+            self.time_lbl.config(text=f"{v} min")
+        else:
+            self.time_lbl.config(text=f"{v//60}h {v%60:02d}m" if v%60 else f"{v//60}hr")
+
     def _pick_folder(self):
         folder = filedialog.askdirectory(title="Select image folder")
         if folder:
@@ -669,6 +755,7 @@ class App(tk.Tk):
                 self._placeholder_lbl.destroy()
             self.vis = VisPanel(self._left_frame)
 
+        self._target_min = self.time_var.get()
         self.running = True
         self.run_btn.config(state="disabled", bg=MUTED, fg=SURFACE)
         self.view_btn.pack_forget()
@@ -700,7 +787,7 @@ class App(tk.Tk):
             def show_cloud(self, *a, **kw):
                 app.vis.show_cloud(*a, **kw)
 
-        run_pipeline(folder, out, app._write, VisProxy(),
+        run_pipeline(folder, out, app._target_min, app._write, VisProxy(),
                      app._done, app._err)
 
     def _done(self, out_path, pcd):
