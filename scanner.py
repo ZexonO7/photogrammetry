@@ -202,18 +202,20 @@ def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good])
 
         try:
+            K_local = K.copy()
             E, mask = cv2.findEssentialMat(
-                src_pts, dst_pts, K, method=cv2.RANSAC, prob=ransac_prob, threshold=1.0
+                src_pts, dst_pts, K_local, method=cv2.RANSAC,
+                prob=float(ransac_prob), threshold=1.0
             )
             if E is None or mask is None:
                 with lock: skipped[0] += 1
                 return
 
-            _, R, t, mask2 = cv2.recoverPose(E, src_pts, dst_pts, K, mask=mask)
+            _, R, t, mask2 = cv2.recoverPose(E, src_pts, dst_pts, K_local, mask=mask)
             angle = math.degrees(math.acos(max(-1, min(1, (np.trace(R) - 1) / 2))))
 
-            P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-            P2 = K @ np.hstack([R, t])
+            P1 = K_local @ np.hstack([np.eye(3), np.zeros((3, 1))])
+            P2 = K_local @ np.hstack([R, t])
 
             inliers = mask2.ravel() == 255
             if inliers.sum() < 8:
@@ -581,8 +583,24 @@ class App(tk.Tk):
         self._left_frame = tk.Frame(panes, bg=MPL_BG)
         panes.add(self._left_frame, minsize=480)
 
-        right = tk.Frame(panes, bg=BG, padx=20, pady=16)
-        panes.add(right, minsize=340)
+        right_outer = tk.Frame(panes, bg=BG)
+        panes.add(right_outer, minsize=340)
+        right_canvas = tk.Canvas(right_outer, bg=BG, highlightthickness=0)
+        right_scroll = tk.Scrollbar(right_outer, orient="vertical",
+                                    command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scroll.set)
+        right_scroll.pack(side="right", fill="y")
+        right_canvas.pack(side="left", fill="both", expand=True)
+        right = tk.Frame(right_canvas, bg=BG, padx=20, pady=16)
+        right_win = right_canvas.create_window((0,0), window=right, anchor="nw")
+        def _on_frame_configure(e):
+            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+        def _on_canvas_configure(e):
+            right_canvas.itemconfig(right_win, width=e.width)
+        right.bind("<Configure>", _on_frame_configure)
+        right_canvas.bind("<Configure>", _on_canvas_configure)
+        right_canvas.bind_all("<MouseWheel>",
+            lambda e: right_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
         self._build_controls(right)
 
         # draw idle placeholder right away
@@ -683,7 +701,7 @@ class App(tk.Tk):
                      anchor="w", pady=(0, 4))
         log_frame = tk.Frame(parent, bg=CARD,
                              highlightbackground=BORDER, highlightthickness=1)
-        log_frame.pack(fill="both", expand=True)
+        log_frame.pack(fill="both", expand=True, pady=(0,0))
         sb = tk.Scrollbar(log_frame, bg=CARD, troughcolor=CARD)
         sb.pack(side="right", fill="y")
         self.log_box = tk.Text(
