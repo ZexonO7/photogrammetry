@@ -164,7 +164,7 @@ def match_features(kp_desc, imgs, log, ratio_test=0.75, min_matches=8, on_match=
         list(ex.map(match_pair, all_pairs))
 
     pairs.sort(key=lambda x: (x[0], x[1]))
-    log(f"  total: {len(pairs)} usable pairs")
+    log(f"  total: {len(pairs)} usable pairs from {len(all_pairs)} checked")
     return pairs
 
 
