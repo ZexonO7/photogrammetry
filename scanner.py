@@ -270,7 +270,10 @@ def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
                         on_points(np.vstack(pts3d_all), np.vstack(col_all))
 
         except Exception as e:
-            with lock: skipped[0] += 1
+            with lock:
+                skipped[0] += 1
+                if skipped[0] <= 3:
+                    log(f"  pair {idx+1} error: {e}")
 
     workers = max(1, __import__('os').cpu_count() - 1)
     log(f"  {len(pairs)} pairs on {workers} cores…")
