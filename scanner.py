@@ -156,9 +156,7 @@ def match_features(kp_desc, imgs, log, ratio_test=0.75, min_matches=8, on_match=
                 cnt = match_counter[0]
             log(f"  pair ({i+1},{j+1})  →  {len(good):,} good matches")
             # only redraw viz every 20 matches to avoid choking the GUI
-            if on_match and cnt % 20 == 1:
-                on_match(imgs[i][1], imgs[j][1],
-                         kp_desc[i][0], kp_desc[j][0], good)
+            # viz update skipped during parallel matching to keep UI responsive
 
     workers = max(1, __import__('os').cpu_count() - 1)
     log(f"  running on {workers} CPU cores in parallel")
@@ -599,7 +597,7 @@ class App(tk.Tk):
             right_canvas.itemconfig(right_win, width=e.width)
         right.bind("<Configure>", _on_frame_configure)
         right_canvas.bind("<Configure>", _on_canvas_configure)
-        right_canvas.bind_all("<MouseWheel>",
+        right_canvas.bind("<MouseWheel>",
             lambda e: right_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
         self._build_controls(right)
 
