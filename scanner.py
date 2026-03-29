@@ -113,8 +113,8 @@ def load_images(folder, log):
     return imgs
 
 
-def detect_features(imgs, log, on_keypoints=None):
-    sift = cv2.SIFT_create(nfeatures=2000)
+def detect_features(imgs, log, nfeatures=3000, on_keypoints=None):
+    sift = cv2.SIFT_create(nfeatures=nfeatures)
     kp_desc = []
     for i, (path, img) in enumerate(imgs):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
