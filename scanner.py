@@ -85,8 +85,8 @@ def auto_settings(n_photos, target_minutes):
     # ratio=1.0 → full quality, ratio=0.2 → fast mode
     nfeatures   = max(500,  int(3000 * ratio))
     ratio_test  = min(0.85, 0.73 + 0.12 * (1 - ratio))
-    ransac_prob = max(0.95, 0.999 - 0.05 * (1 - ratio))
-    min_matches = max(6,    int(10 - 4 * ratio))
+    ransac_prob = max(0.85, 0.95 - 0.1 * (1 - ratio))
+    min_matches = max(4,    int(8 - 3 * ratio))
 
     return nfeatures, ratio_test, ransac_prob, min_matches, full_time_min
 
@@ -170,7 +170,7 @@ def match_features(kp_desc, imgs, log, ratio_test=0.75, min_matches=8, on_match=
 
 def estimate_camera(img_shape):
     h, w = img_shape[:2]
-    f = max(w, h) * 1.2
+    f = max(w, h) * 1.5
     return np.array([[f, 0, w/2],
                      [0, f, h/2],
                      [0, 0,   1]], dtype=np.float64)
@@ -216,7 +216,7 @@ def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
             P2 = K_local @ np.hstack([R, t])
 
             inliers = mask2.ravel() == 255
-            if inliers.sum() < 8:
+            if inliers.sum() < 4:
                 with lock: skipped[0] += 1
                 return
 
@@ -242,17 +242,21 @@ def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
 
             depths = pts3d[:, 2]
             valid  = np.isfinite(depths) & (depths > 0)
-            if valid.sum() < 4:
+            if valid.sum() < 3:
                 with lock: skipped[0] += 1
                 return
 
-            thresh = np.percentile(depths[valid], 95)
+            valid_depths = depths[valid]
+            if len(valid_depths) > 4:
+                thresh = np.percentile(valid_depths, 95)
+            else:
+                thresh = np.max(valid_depths) * 1.5
             keep   = valid & (depths < thresh)
 
             batch_pts = pts3d[keep]
             batch_col = colours[keep]
 
-            if len(batch_pts) == 0:
+            if len(batch_pts) < 2:
                 with lock: skipped[0] += 1
                 return
 
@@ -296,7 +300,7 @@ def save_cloud(pts3d, colours, out_path, log):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts3d)
     pcd.colors = o3d.utility.Vector3dVector(np.clip(colours, 0, 1))
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=3.0)
     o3d.io.write_point_cloud(out_path, pcd)
     log(f"  saved  →  {out_path}")
     log(f"  {len(pcd.points):,} points after outlier cleanup")
