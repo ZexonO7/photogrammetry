@@ -83,10 +83,10 @@ def auto_settings(n_photos, target_minutes):
 
     # map ratio → params
     # ratio=1.0 → full quality, ratio=0.2 → fast mode
-    nfeatures   = max(500,  int(3000 * ratio))
-    ratio_test  = min(0.85, 0.73 + 0.12 * (1 - ratio))
-    ransac_prob = max(0.85, 0.95 - 0.1 * (1 - ratio))
-    min_matches = max(4,    int(8 - 3 * ratio))
+    nfeatures   = max(1000, int(3000 * ratio))
+    ratio_test  = min(0.9, 0.8 + 0.1 * (1 - ratio))
+    ransac_prob = max(0.7, 0.9 - 0.2 * (1 - ratio))
+    min_matches = max(3,   int(6 - 2 * ratio))
 
     return nfeatures, ratio_test, ransac_prob, min_matches, full_time_min
 
@@ -203,7 +203,7 @@ def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
             K_local = K.copy()
             E, mask = cv2.findEssentialMat(
                 src_pts, dst_pts, K_local, method=cv2.RANSAC,
-                prob=float(ransac_prob), threshold=1.0
+                prob=float(ransac_prob), threshold=2.0
             )
             if E is None or mask is None:
                 with lock: skipped[0] += 1
@@ -216,7 +216,7 @@ def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
             P2 = K_local @ np.hstack([R, t])
 
             inliers = mask2.ravel() == 255
-            if inliers.sum() < 4:
+            if inliers.sum() < 3:
                 with lock: skipped[0] += 1
                 return
 
@@ -242,21 +242,21 @@ def reconstruct(kp_desc, pairs, imgs, log, ransac_prob=0.999, on_points=None):
 
             depths = pts3d[:, 2]
             valid  = np.isfinite(depths) & (depths > 0)
-            if valid.sum() < 3:
+            if valid.sum() < 2:
                 with lock: skipped[0] += 1
                 return
 
             valid_depths = depths[valid]
-            if len(valid_depths) > 4:
-                thresh = np.percentile(valid_depths, 95)
+            if len(valid_depths) > 2:
+                thresh = np.percentile(valid_depths, 98)
             else:
-                thresh = np.max(valid_depths) * 1.5
+                thresh = np.max(valid_depths) * 2.0
             keep   = valid & (depths < thresh)
 
             batch_pts = pts3d[keep]
             batch_col = colours[keep]
 
-            if len(batch_pts) < 2:
+            if len(batch_pts) < 1:
                 with lock: skipped[0] += 1
                 return
 
